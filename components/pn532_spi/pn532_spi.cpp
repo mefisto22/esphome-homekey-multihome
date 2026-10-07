@@ -1,0 +1,179 @@
+#include "pn532_spi.h"
+#include "esphome/core/helpers.h"
+#include "esphome/core/log.h"
+
+// Based on:
+// - https://cdn-shop.adafruit.com/datasheets/PN532C106_Application+Note_v1.2.pdf
+// - https://www.nxp.com/docs/en/nxp/application-notes/AN133910.pdf
+// - https://www.nxp.com/docs/en/nxp/application-notes/153710.pdf
+
+namespace esphome {
+namespace pn532_spi {
+
+static const char *const TAG = "pn532_spi";
+
+// Maximum bytes to log in verbose hex output
+static constexpr size_t PN532_MAX_LOG_BYTES = 64;
+
+void PN532Spi::setup() {
+  this->spi_setup();
+
+  this->cs_->digital_write(false);
+  delay(10);
+  PN532::setup();
+}
+
+bool PN532Spi::is_read_ready() {
+  this->enable();
+  this->write_byte(0x02);
+  bool ready = this->read_byte() == 0x01;
+  this->disable();
+  return ready;
+}
+
+bool PN532Spi::write_data(const std::vector<uint8_t> &data) {
+  this->enable();
+  delay(2);
+  // First byte, communication mode: Write data
+  this->write_byte(0x01);
+#if ESPHOME_LOG_LEVEL >= ESPHOME_LOG_LEVEL_VERBOSE
+  char hex_buf[format_hex_pretty_size(PN532_MAX_LOG_BYTES)];
+#endif
+  ESP_LOGV(TAG, "Writing data: %s", format_hex_pretty_to(hex_buf, sizeof(hex_buf), data.data(), data.size()));
+  this->write_array(data.data(), data.size());
+  this->disable();
+
+  return true;
+}
+
+bool PN532Spi::read_data(std::vector<uint8_t> &data, uint8_t len) {
+  if (this->read_ready_(true) != pn532::PN532ReadReady::READY) {
+    return false;
+  }
+
+  // Read data (transmission from the PN532 to the host)
+  this->enable();
+  delay(2);
+  this->write_byte(0x03);
+
+  ESP_LOGV(TAG, "Reading data");
+
+  data.resize(len);
+  this->read_array(data.data(), len);
+  this->disable();
+  data.insert(data.begin(), 0x01);
+#if ESPHOME_LOG_LEVEL >= ESPHOME_LOG_LEVEL_VERBOSE
+  char hex_buf[format_hex_pretty_size(PN532_MAX_LOG_BYTES)];
+#endif
+  ESP_LOGV(TAG, "Read data: %s", format_hex_pretty_to(hex_buf, sizeof(hex_buf), data.data(), data.size()));
+  return true;
+}
+
+bool PN532Spi::read_response(uint8_t command, std::vector<uint8_t> &data) {
+  ESP_LOGV(TAG, "Reading response");
+
+  if (this->read_ready_(true) != pn532::PN532ReadReady::READY) {
+    return false;
+  }
+
+  this->enable();
+  delay(2);
+  this->write_byte(0x03);
+
+  std::vector<uint8_t> header(7);
+  this->read_array(header.data(), 7);
+
+#if ESPHOME_LOG_LEVEL >= ESPHOME_LOG_LEVEL_VERBOSE
+  char hex_buf[format_hex_pretty_size(PN532_MAX_LOG_BYTES)];
+#endif
+  ESP_LOGV(TAG, "Header data: %s", format_hex_pretty_to(hex_buf, sizeof(hex_buf), header.data(), header.size()));
+
+  if (header[0] != 0x00 || header[1] != 0x00 || header[2] != 0xFF) {
+    // invalid packet
+    ESP_LOGV(TAG, "read data invalid preamble!");
+    this->disable();
+    return false;
+  }
+
+  bool valid_header = (static_cast<uint8_t>(header[3] + header[4]) == 0 &&  // LCS, len + lcs = 0
+                       header[5] == 0xD5 &&        // TFI - frame from PN532 to system controller
+                       header[6] == command + 1);  // Correct command response
+
+  bool error_frame = (static_cast<uint8_t>(header[3] + header[4]) == 0 &&
+                      header[5] == 0x7F &&
+                      header[6] == 0x81);
+
+  bool extended_frame = (header[3] == 0xFF && header[4] == 0xFF);
+
+  if (!valid_header && !error_frame && !extended_frame) {
+    ESP_LOGV(TAG, "read data invalid header!");
+    this->disable();
+    return false;
+  }
+
+  // full length of message, including command response (minimum 2: TFI + command response)
+  uint16_t full_len = header[3];
+  if (full_len < 2) {                         
+    ESP_LOGV(TAG, "read data has no payload");
+    this->disable();                          
+    return false;                             
+  }
+  if (extended_frame) {
+    ESP_LOGV(TAG, "Abnormal length and checksum, possible Extended Frame");
+    header.resize(10);
+    this->read_array(header.data() + 7, 3);
+    ESP_LOGV(TAG, "EF: Header data: %s", format_hex_pretty(header).c_str());
+    if ((uint8_t)(header[5] + header[6] + header[7]) != 0) {
+      ESP_LOGV(TAG, "EF: read data invalid header!");
+      this->disable();
+      return false;
+    }
+    full_len = ((((uint16_t)header[5]) << 8) | header[6]);
+  }
+  // length of data, excluding command response
+  uint16_t len = full_len - 1;
+
+  ESP_LOGV(TAG, "Reading response of length %d", len);
+
+  data.resize(len + 1);
+  this->read_array(data.data(), len + 1);
+  this->disable();
+
+  ESP_LOGV(TAG, "Response data: %s", format_hex_pretty_to(hex_buf, sizeof(hex_buf), data.data(), data.size()));
+
+  uint8_t checksum = header[5] + header[6];  // TFI + Command response code
+  if (extended_frame) {
+    checksum = header[8] + header[9];
+  }
+  for (int i = 0; i < len - 1; i++) {
+    uint8_t dat = data[i];
+    checksum += dat;
+  }
+  checksum = ~checksum + 1;
+
+  if (data[len - 1] != checksum) {
+    ESP_LOGV(TAG, "read data invalid checksum! %02X != %02X", data[len - 1], checksum);
+    return false;
+  }
+
+  if (data[len] != 0x00) {
+    ESP_LOGV(TAG, "read data invalid postamble!");
+    return false;
+  }
+
+  data.erase(data.end() - 2, data.end());  // Remove checksum and postamble
+
+  if (error_frame) {
+    return false;
+  }
+
+  return true;
+}
+
+void PN532Spi::dump_config() {
+  PN532::dump_config();
+  LOG_PIN("  CS Pin: ", this->cs_);
+}
+
+}  // namespace pn532_spi
+}  // namespace esphome

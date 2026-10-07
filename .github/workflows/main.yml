@@ -1,0 +1,57 @@
+# This is a basic workflow to help you get started with Actions
+
+name: CI
+
+# Controls when the action will run. Triggers the workflow on push or pull request
+# events but only for the master branch
+on:
+  push:
+    branches: [ main, dev ]
+    paths:
+      - 'components/**'
+      - '.github/workflows/main.yml'
+      - '*.yaml'
+      - '*.yml'
+  pull_request:
+    branches: [ main, dev ]
+
+jobs:
+  build:
+    runs-on: ubuntu-latest
+
+    steps:
+      - name: Checkout
+        uses: actions/checkout@v4
+        with:
+          fetch-depth: 0
+          fetch-tags: true
+      - uses: actions/cache@v4
+        with:
+          path: |
+            ~/.cache/pip
+            ~/.platformio/.cache
+          key: ${{ runner.os }}-esphome
+      - uses: actions/setup-python@v5
+        with:
+          python-version: '3.11'
+      - name: Install PlatformIO Core
+        run: pip install --upgrade platformio
+      - name: Install ESPHome
+        run: pip install esphome
+      - name: Create dummy secrets.yml
+        run: |
+          touch secrets.yaml
+          echo 'wifi_ssid: "ssid"' >> secrets.yaml
+          echo 'wifi_password: "password"' >> secrets.yaml
+          openssl rand 32 | base64 | xargs printf 'api_key: "%s"\n' >> secrets.yaml
+          openssl rand 32 | base64 | xargs printf 'ota_password: "%s"\n' >> secrets.yaml
+      - name: Compile test configuration
+        run: esphome compile test.yaml
+
+  homekey-host-tests:
+    runs-on: ubuntu-latest
+    steps:
+      - name: Checkout
+        uses: actions/checkout@v4
+      - name: HomeKey store host tests (incl. vendored HK-HomeKit-Lib)
+        run: ./tests/homekey_host/run_tests.sh
